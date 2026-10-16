@@ -68,6 +68,9 @@ def navigation(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+def phone_relay_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and os.path.isfile("/data/phone-relay/config.json")
+
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
@@ -172,6 +175,9 @@ procs = [
 
 # sunnypilot
 procs += [
+  # Optional read-only phone recording relay, off until /data/phone-relay is paired
+  PythonProcess("phone_relay", "openpilot.sunnypilot.phone_relay.device", phone_relay_ready),
+
   # Models
   PythonProcess("models_manager", "openpilot.sunnypilot.models.manager", only_offroad),
   NativeProcess("modeld_tinygrad", "openpilot/sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),

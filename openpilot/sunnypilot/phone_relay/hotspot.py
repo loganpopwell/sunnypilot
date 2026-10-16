@@ -1,7 +1,7 @@
 """Automatic access point so the paired iPhone can reach the comma away from known Wi-Fi.
 
 Client first: whenever the comma is on a saved Wi-Fi network (e.g. home) nothing changes.
-After NO_WIFI_SECONDS without a Wi-Fi client connection, a dedicated AP ("phone-relay-ap") is
+After NO_WIFI_SECONDS (20 s) without a Wi-Fi client connection, a dedicated AP ("phone-relay-ap") is
 started with the pairing SSID/passphrase. After RESCAN_SECONDS parked with the AP up, it is
 dropped once so the comma can rejoin home Wi-Fi; if none appears it comes back. It is never
 dropped while the phone has used the relay in the last two minutes. A user-enabled
@@ -12,7 +12,7 @@ import time
 
 CONNECTION = 'phone-relay-ap'
 ADDRESS = '192.168.44.1/24'
-NO_WIFI_SECONDS = 60
+NO_WIFI_SECONDS = 20  # home Wi-Fi never reaches the car; NetworkManager joins known networks well within this
 RESCAN_SECONDS = 300
 RESCAN_WINDOW = 45
 
@@ -67,12 +67,13 @@ class HotspotManager:
         self.parked_since = None
         self.rescan_until = None
         self.ready = False
+        self.last_connection = None
 
     def step(self):
         if not self.ready:
             self.nm.ensure(self.ssid, self.psk); self.ready = True
         now = self.clock()
-        active = self.nm.wlan_connection()
+        active = self.last_connection = self.nm.wlan_connection()
         if active == 'Hotspot':  # user turned on Tethering; leave it alone
             self.parked_since = None; self.no_wifi_since = now
             return 'tethering'
@@ -99,11 +100,13 @@ class HotspotManager:
         return 'waiting'
 
 
-def run(ssid, psk, onroad, stop, busy=lambda: False):
+def run(ssid, psk, onroad, stop, busy=lambda: False, state=None):
     manager = HotspotManager(ssid, psk, onroad, busy=busy)
     while not stop.is_set():
         try:
-            manager.step()
+            mode = manager.step()
+            if state is not None:
+                state['wifi'] = {'mode': mode, 'connection': manager.last_connection}
         except Exception:
             pass  # never take the relay down over Wi-Fi management
         stop.wait(5)

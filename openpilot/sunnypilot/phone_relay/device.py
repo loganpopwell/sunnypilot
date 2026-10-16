@@ -1,6 +1,7 @@
 """Read-only TLS file server. Disabled without external pairing configuration.
 
-Only closed logger segments, only offroad, bounded requests, no Param writes.
+Only closed logger segments (no .lock files), bounded requests, no Param writes.
+While driving, all reads (hashing and transfers) share a low byte-rate budget.
 """
 import hashlib
 import hmac
@@ -18,12 +19,30 @@ from .common import FILE, MAX_FILE, atomic_json
 
 
 SERVED = ('qlog.zst', 'fcamera.hevc')
+ONROAD_RATE = 4 * 1024 * 1024  # bytes/s shared by every read while driving (recording is ~0.6 MiB/s)
+
+
+class Budget:
+    """Token bucket shared across threads. No limit while parked."""
+    def __init__(self, onroad, rate=ONROAD_RATE):
+        self.onroad, self.rate = onroad, rate
+        self.lock = threading.Lock()
+        self.next = time.monotonic()
+    def take(self, n):
+        if not self.onroad():
+            return
+        with self.lock:
+            now = time.monotonic()
+            self.next = max(self.next, now) + n / self.rate
+            wait = self.next - n / self.rate - now
+        if wait > 0:
+            time.sleep(wait)
 
 
 class RecordingStore:
-    def __init__(self, root, offroad, served=SERVED, cache=None):
+    def __init__(self, root, onroad=lambda: False, served=SERVED, cache=None):
         self.root = Path(root).resolve()
-        self.offroad = offroad
+        self.budget = Budget(onroad)
         self.served = tuple(served)
         # Hashes keyed by path and (inode, size, mtime) so each file is read once.
         self.cache_path = Path(cache) if cache else None
@@ -35,8 +54,6 @@ class RecordingStore:
                 self.hashes = {}
 
     def open_file(self, name):
-        if not self.offroad():
-            raise PermissionError('Park and switch off driving session to sync')
         if not FILE.fullmatch(name) or name.split('/')[1] not in self.served:
             raise FileNotFoundError()
         segment, filename = name.split('/')
@@ -74,8 +91,7 @@ class RecordingStore:
                     else:
                         h = hashlib.sha256()
                         for block in iter(lambda: f.read(1024 * 1024), b''):
-                            if not self.offroad():
-                                raise PermissionError()
+                            self.budget.take(len(block))
                             h.update(block)
                         after = os.fstat(f.fileno())
                         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
@@ -129,8 +145,6 @@ def handler(store, token_hash):
             try:
                 url = urlsplit(self.path)
                 if url.path == '/v1/manifest':
-                    if not store.offroad():
-                        raise PermissionError()
                     offset = int(parse_qs(url.query).get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError()
@@ -172,15 +186,12 @@ def handler(store, token_hash):
                         f.seek(start)
                         remaining = end-start+1
                         while remaining:
-                            if not store.offroad():
-                                self.close_connection = True
-                                return
                             block = f.read(min(256*1024, remaining))
                             if not block:
                                 return
                             self.wfile.write(block)
                             remaining -= len(block)
-                            time.sleep(0.004)  # Yield briefly between 256 KiB blocks (~60 MiB/s cap); still offroad-only.
+                            store.budget.take(len(block))
                 else:
                     self.send_error(404)
             except PermissionError:
@@ -205,10 +216,11 @@ def main():
     context.load_cert_chain('/data/phone-relay/cert.pem', '/data/phone-relay/key.pem')
     from openpilot.common.params import Params
     params = Params()
-    def offroad():
-        return params.get_bool('IsOffroad')
-    store = RecordingStore('/data/media/0/realdata', offroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
-    os.nice(15)
+    def onroad():
+        return not params.get_bool('IsOffroad')
+    store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
+    os.nice(19)
+    os.system(f'ionice -c3 -p {os.getpid()} >/dev/null 2>&1')  # idle I/O class: never competes with loggerd
     server = BoundedServer(('0.0.0.0', 8743), handler(store, config['token_sha256']))
     server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()

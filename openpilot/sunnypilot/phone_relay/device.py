@@ -110,10 +110,27 @@ class RecordingStore:
 
 
 class BoundedServer(ThreadingMixIn, HTTPServer):
+    """TLS handshakes happen on the worker thread with a timeout, so a client that vanishes
+    mid-handshake (e.g. Wi-Fi dropped) can never block accept() for everyone else."""
     daemon_threads = True
-    def __init__(self, *args, **kwargs):
-        self.slots = threading.BoundedSemaphore(2)
+    def __init__(self, *args, tls=None, slots=4, **kwargs):
+        self.slots = threading.BoundedSemaphore(slots)
+        self.tls = tls
+        self.last_activity = 0.0  # monotonic time of the last served request
         super().__init__(*args, **kwargs)
+    def finish_request(self, request, address):
+        request.settimeout(20)
+        if self.tls is not None:
+            try:
+                request = self.tls.wrap_socket(request, server_side=True)
+            except (OSError, ValueError):
+                request.close()
+                return
+        self.last_activity = time.monotonic()
+        try:
+            super().finish_request(request, address)
+        finally:
+            self.last_activity = time.monotonic()
     def process_request(self, request, address):
         if not self.slots.acquire(blocking=False):
             request.close()
@@ -186,7 +203,7 @@ def handler(store, token_hash):
                         f.seek(start)
                         remaining = end-start+1
                         while remaining:
-                            block = f.read(min(256*1024, remaining))
+                            block = f.read(min(1024*1024, remaining))
                             if not block:
                                 return
                             self.wfile.write(block)
@@ -219,14 +236,14 @@ def main():
     def onroad():
         return not params.get_bool('IsOffroad')
     store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
+    server = BoundedServer(('0.0.0.0', 8743), handler(store, config['token_sha256']), tls=context)
     hotspot = config.get('hotspot')
     if hotspot:  # optional: own Wi-Fi for the phone when no saved network is around
         from .hotspot import run as run_hotspot
-        threading.Thread(target=run_hotspot, args=(hotspot['ssid'], hotspot['psk'], onroad, threading.Event()), daemon=True).start()
+        busy = lambda: time.monotonic() - server.last_activity < 120  # phone is still pulling footage
+        threading.Thread(target=run_hotspot, args=(hotspot['ssid'], hotspot['psk'], onroad, threading.Event(), busy), daemon=True).start()
     os.nice(19)
     os.system(f'ionice -c3 -p {os.getpid()} >/dev/null 2>&1')  # idle I/O class: never competes with loggerd
-    server = BoundedServer(('0.0.0.0', 8743), handler(store, config['token_sha256']))
-    server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
 
 

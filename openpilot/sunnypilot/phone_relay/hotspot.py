@@ -3,7 +3,8 @@
 Client first: whenever the comma is on a saved Wi-Fi network (e.g. home) nothing changes.
 After NO_WIFI_SECONDS without a Wi-Fi client connection, a dedicated AP ("phone-relay-ap") is
 started with the pairing SSID/passphrase. After RESCAN_SECONDS parked with the AP up, it is
-dropped once so the comma can rejoin home Wi-Fi; if none appears it comes back. A user-enabled
+dropped once so the comma can rejoin home Wi-Fi; if none appears it comes back. It is never
+dropped while the phone has used the relay in the last two minutes. A user-enabled
 Tethering ("Hotspot") connection always wins: this never touches it.
 """
 import subprocess
@@ -58,8 +59,8 @@ class Nmcli:
 
 
 class HotspotManager:
-    def __init__(self, ssid, psk, onroad, nm=None, clock=time.monotonic):
-        self.ssid, self.psk, self.onroad = ssid, psk, onroad
+    def __init__(self, ssid, psk, onroad, nm=None, clock=time.monotonic, busy=lambda: False):
+        self.ssid, self.psk, self.onroad, self.busy = ssid, psk, onroad, busy
         self.nm = nm or Nmcli()
         self.clock = clock
         self.no_wifi_since = clock()
@@ -76,7 +77,7 @@ class HotspotManager:
             self.parked_since = None; self.no_wifi_since = now
             return 'tethering'
         if active == CONNECTION:
-            if self.onroad():
+            if self.onroad() or self.busy():  # driving, or the phone is still pulling footage
                 self.parked_since = None
                 return 'ap'
             if self.parked_since is None:
@@ -98,8 +99,8 @@ class HotspotManager:
         return 'waiting'
 
 
-def run(ssid, psk, onroad, stop):
-    manager = HotspotManager(ssid, psk, onroad)
+def run(ssid, psk, onroad, stop, busy=lambda: False):
+    manager = HotspotManager(ssid, psk, onroad, busy=busy)
     while not stop.is_set():
         try:
             manager.step()

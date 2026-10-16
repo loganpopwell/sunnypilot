@@ -219,6 +219,10 @@ def main():
     def onroad():
         return not params.get_bool('IsOffroad')
     store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
+    hotspot = config.get('hotspot')
+    if hotspot:  # optional: own Wi-Fi for the phone when no saved network is around
+        from .hotspot import run as run_hotspot
+        threading.Thread(target=run_hotspot, args=(hotspot['ssid'], hotspot['psk'], onroad, threading.Event()), daemon=True).start()
     os.nice(19)
     os.system(f'ionice -c3 -p {os.getpid()} >/dev/null 2>&1')  # idle I/O class: never competes with loggerd
     server = BoundedServer(('0.0.0.0', 8743), handler(store, config['token_sha256']))

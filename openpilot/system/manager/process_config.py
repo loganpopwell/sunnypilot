@@ -69,7 +69,8 @@ def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
 def phone_relay_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return not started and os.path.isfile("/data/phone-relay/config.json")
+  # runs onroad too: serves closed segments only, rate-limited, nice 19 + idle I/O
+  return os.path.isfile("/data/phone-relay/config.json")
 
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")

@@ -1,7 +1,7 @@
 """Automatic access point so the paired iPhone can reach the comma away from known Wi-Fi.
 
 Client first: whenever the comma is on a saved Wi-Fi network (e.g. home) nothing changes.
-After NO_WIFI_SECONDS (20 s) without a Wi-Fi client connection, a dedicated AP ("phone-relay-ap") is
+After STARTUP_SECONDS (45 s) from boot, or NO_WIFI_SECONDS (20 s) after a connection drops, without a Wi-Fi client connection, a dedicated AP ("phone-relay-ap") is
 started with the pairing SSID/passphrase. After RESCAN_SECONDS parked with the AP up, it is
 dropped once so the comma can rejoin home Wi-Fi; if none appears it comes back. It is never
 dropped while the phone has used the relay in the last two minutes. A user-enabled
@@ -12,7 +12,8 @@ import time
 
 CONNECTION = 'phone-relay-ap'
 ADDRESS = '192.168.44.1/24'
-NO_WIFI_SECONDS = 20  # home Wi-Fi never reaches the car; NetworkManager joins known networks well within this
+NO_WIFI_SECONDS = 20  # home Wi-Fi never reaches the car, so don't wait long once a connection is gone
+STARTUP_SECONDS = 45  # after boot, give NetworkManager time to rejoin a saved network first
 RESCAN_SECONDS = 300
 RESCAN_WINDOW = 45
 
@@ -63,7 +64,7 @@ class HotspotManager:
         self.ssid, self.psk, self.onroad, self.busy = ssid, psk, onroad, busy
         self.nm = nm or Nmcli()
         self.clock = clock
-        self.no_wifi_since = clock()
+        self.no_wifi_since = clock() + STARTUP_SECONDS - NO_WIFI_SECONDS
         self.parked_since = None
         self.rescan_until = None
         self.ready = False

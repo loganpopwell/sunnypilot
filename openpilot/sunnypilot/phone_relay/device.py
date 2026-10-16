@@ -18,8 +18,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .common import FILE, MAX_FILE, atomic_json
 
 
-SERVED = ('qlog.zst', 'fcamera.hevc')
-ONROAD_RATE = 4 * 1024 * 1024  # bytes/s shared by every read while driving (recording is ~0.6 MiB/s)
+SERVED = ('qlog.zst', 'fcamera.hevc', 'ecamera.hevc')
+# Bytes/s shared by every read while driving. Both cameras record ~1.2 MB/s and each file is read twice
+# (hash, then send), so this leaves room to catch up on a backlog.
+ONROAD_RATE = 8 * 1024 * 1024
 
 
 class Budget:
@@ -67,6 +69,18 @@ class RecordingStore:
             f.close()
             raise FileNotFoundError()
         return f
+
+    def status(self):
+        """Small summary for the phone's test mode. No file contents, no hashing."""
+        segments = sorted((p for p in self.root.glob('*--*') if p.is_dir() and not p.is_symlink()),
+                          key=lambda p: (p.name.rsplit('--', 1)[0], int(p.name.rsplit('--', 1)[1]) if p.name.rsplit('--', 1)[1].isdigit() else -1))
+        newest = segments[-1] if segments else None
+        recording = bool(newest and (list(newest.glob('*.lock')) or (newest / '.lock').exists()))
+        usage = os.statvfs(self.root)
+        return {'onroad': bool(self.budget.onroad()), 'recording': recording, 'segments': len(segments),
+                'newest': newest.name if newest else None, 'newest_mtime': newest.stat().st_mtime if newest else None,
+                'free_bytes': usage.f_bavail * usage.f_frsize, 'served': list(self.served),
+                'onroad_rate': self.budget.rate, 'time': time.time()}
 
     def manifest(self, offset=0):
         # Pagination is stable for a stationary recording directory; repeated scans dedupe by hash.
@@ -117,6 +131,7 @@ class BoundedServer(ThreadingMixIn, HTTPServer):
         self.slots = threading.BoundedSemaphore(slots)
         self.tls = tls
         self.last_activity = 0.0  # monotonic time of the last served request
+        self.active = 0  # connections being served now
         super().__init__(*args, **kwargs)
     def finish_request(self, request, address):
         request.settimeout(20)
@@ -141,13 +156,15 @@ class BoundedServer(ThreadingMixIn, HTTPServer):
             self.slots.release()
             raise
     def process_request_thread(self, request, address):
+        self.active += 1
         try:
             super().process_request_thread(request, address)
         finally:
+            self.active -= 1
             self.slots.release()
 
 
-def handler(store, token_hash):
+def handler(store, token_hash, wifi_state=None, server_slots=None):
     class Handler(BaseHTTPRequestHandler):
         def setup(self):
             super().setup()
@@ -161,7 +178,18 @@ def handler(store, token_hash):
                 return
             try:
                 url = urlsplit(self.path)
-                if url.path == '/v1/manifest':
+                if url.path == '/v1/status':
+                    value = store.status()
+                    value['wifi'] = wifi_state() if wifi_state else None
+                    value['active_connections'] = server_slots() if server_slots else None
+                    data = json.dumps(value).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
+                    self.wfile.write(data)
+                elif url.path == '/v1/manifest':
                     offset = int(parse_qs(url.query).get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError()
@@ -236,12 +264,16 @@ def main():
     def onroad():
         return not params.get_bool('IsOffroad')
     store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
-    server = BoundedServer(('0.0.0.0', 8743), handler(store, config['token_sha256']), tls=context)
+    state = {}
+    server = BoundedServer(('0.0.0.0', 8743), None, tls=context)
+    server.RequestHandlerClass = handler(store, config['token_sha256'], lambda: state.get('wifi'),
+                                         lambda: server.active)
     hotspot = config.get('hotspot')
     if hotspot:  # optional: own Wi-Fi for the phone when no saved network is around
         from .hotspot import run as run_hotspot
         busy = lambda: time.monotonic() - server.last_activity < 120  # phone is still pulling footage
-        threading.Thread(target=run_hotspot, args=(hotspot['ssid'], hotspot['psk'], onroad, threading.Event(), busy), daemon=True).start()
+        threading.Thread(target=run_hotspot, args=(hotspot['ssid'], hotspot['psk'], onroad, threading.Event(), busy, state),
+                         daemon=True).start()
     os.nice(19)
     os.system(f'ionice -c3 -p {os.getpid()} >/dev/null 2>&1')  # idle I/O class: never competes with loggerd
     server.serve_forever()

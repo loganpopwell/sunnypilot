@@ -17,6 +17,17 @@ function agnos_init {
   sudo chgrp gpu /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
   sudo chmod 660 /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
 
+  # same for the sound card: micd/soundd give up if /dev/snd is still root-only (commaai/agnos-builder#633)
+  (
+    for _ in $(seq 1 120); do
+      if [ "$(cat /proc/asound/card0/state 2>/dev/null)" = "ONLINE" ]; then
+        sudo chgrp audio /dev/snd/* && sudo chmod 660 /dev/snd/*
+        break
+      fi
+      sleep 0.5
+    done
+  ) &
+
   # Check if AGNOS update is required
   if [ "$(< /VERSION)" != "$AGNOS_VERSION" ]; then
     AGNOS_PY="$DIR/openpilot/common/hardware/comma/agnos.py"

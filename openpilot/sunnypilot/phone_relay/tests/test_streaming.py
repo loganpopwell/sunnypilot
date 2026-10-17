@@ -95,7 +95,10 @@ class StreamingTest(unittest.TestCase):
     self.assertEqual(store.manifest()['files'][0]['sha256'], want)
     r, _ = self.get(port, '/v1/files/' + name, {'Range': 'bytes=0-9'})
     self.assertEqual(r.getheader('X-Content-SHA256'), want)
-    # Survives a restart.
+    # Survives a restart (the serving thread writes the cache just after the last byte goes out).
+    deadline = time.monotonic() + 5
+    while name not in (json.loads(cache.read_text()) if cache.exists() else {}) and time.monotonic() < deadline:
+      time.sleep(0.05)
     self.assertEqual(RecordingStore(self.root, cache=cache).manifest()['files'][0]['sha256'], want)
 
   def test_resumed_download_continues_the_hash(self):

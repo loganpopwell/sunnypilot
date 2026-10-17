@@ -84,9 +84,10 @@ class BackedUpTest(unittest.TestCase):
     self.assertFalse(is_backed_up(self.root / locked / 'qlog.zst'))
 
   def test_auth_and_bad_bodies(self):
-    with self.assertRaises(urllib.error.HTTPError) as e:
-      self.post({'files': []}, token='wrong')
-    self.assertEqual(e.exception.code, 401)
+    for body in ({'files': []}, {'files': [{'path': SEG + '/qlog.zst', 'size': 10}] * 2000}):
+      with self.assertRaises(urllib.error.HTTPError) as e:  # a status, not a reset, even with a large body
+        self.post(body, token='wrong')
+      self.assertEqual(e.exception.code, 401)
     for raw in (b'{', b'[]', b'{"files": 3}', json.dumps({'files': [{}] * (MAX_BACKED_UP + 1)}).encode()):
       with self.assertRaises(urllib.error.HTTPError) as e:
         self.post(None, raw=raw)

@@ -1,0 +1,160 @@
+name: Sync logan-staging with upstream staging
+
+# Upstream publishes each staging build as a fresh single commit with no shared history, so an
+# update means: take the new upstream commit and replay Logan's commits on top of it.
+
+on:
+  schedule:
+    - cron: '23 1,7,13,19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-logan-staging
+  cancel-in-progress: false
+
+env:
+  TARGET: logan-staging
+  ROLLBACK: logan-staging-prev
+  UPSTREAM_URL: https://github.com/sunnypilot/sunnypilot.git
+  UPSTREAM_BRANCH: staging
+  ISSUE_TITLE: 'logan-staging: upstream sync conflict'
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out logan-staging
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: logan-staging
+          # The branch is one upstream build plus a handful of commits; this reaches its root
+          # without pulling the fork's other branches.
+          fetch-depth: 200
+
+      - name: Fetch upstream staging
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --depth=1 --no-tags "$UPSTREAM_URL" "$UPSTREAM_BRANCH"
+          echo "UPSTREAM=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      - name: Find the current base build and Logan's commits
+        id: plan
+        run: |
+          old_head=$(git rev-parse HEAD)
+          base=$(git log -1 --format=%H --author='github-actions[bot]' --fixed-strings --grep='(staging)' HEAD)
+          if [ -z "$base" ]; then
+            echo "::error::no upstream staging build commit found in $TARGET"; exit 1
+          fi
+          git rev-list --reverse --no-merges "$base..HEAD" > ../logan-commits.txt
+          if [ ! -s ../logan-commits.txt ]; then
+            echo "::error::no commits on top of the base build; refusing to replace $TARGET"; exit 1
+          fi
+          echo "old_head=$old_head" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Current"
+            echo "- head: \`$old_head\`"
+            echo "- base build: $(git log -1 --format='`%h` %B' "$base" | tr '\n' ' ')"
+            echo "- upstream staging: $(git log -1 --format='`%h` %B' "$UPSTREAM" | tr '\n' ' ')"
+            echo "- Logan's commits: $(wc -l < ../logan-commits.txt)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$(git rev-parse "$base^{tree}")" = "$(git rev-parse "$UPSTREAM^{tree}")" ]; then
+            echo "Upstream staging is unchanged; nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Replay Logan's commits on the new build
+        id: replay
+        if: steps.plan.outputs.update == 'true'
+        run: |
+          git checkout -q --detach "$UPSTREAM"
+          while read -r commit; do
+            if ! git cherry-pick --empty=drop "$commit"; then
+              {
+                echo "conflict=$commit"
+                echo "subject=$(git log -1 --format=%s "$commit")"
+                echo "files<<EOF"
+                git diff --name-only --diff-filter=U
+                echo "EOF"
+              } >> "$GITHUB_OUTPUT"
+              git cherry-pick --abort || true
+              echo "::error::cherry-pick of $commit conflicted"
+              exit 1
+            fi
+          done < ../logan-commits.txt
+          echo "new_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Replayed"
+            git log --format='- `%h` %s' "$UPSTREAM..HEAD"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test
+        if: steps.plan.outputs.update == 'true'
+        run: |
+          # The build ships aarch64 native modules that don't import here, so only stdlib tests run.
+          python3 --version
+          git diff --name-only --diff-filter=AM "$UPSTREAM" HEAD -- '*.py' > ../changed.txt
+          cat ../changed.txt
+          [ -s ../changed.txt ] && xargs -a ../changed.txt python3 -m py_compile
+          python3 -m unittest -v \
+            openpilot.system.loggerd.tests.test_deleter_backup \
+            openpilot.sunnypilot.phone_relay.tests.test_backed_up
+
+      - name: Publish
+        if: steps.plan.outputs.update == 'true'
+        env:
+          OLD_HEAD: ${{ steps.plan.outputs.old_head }}
+          NEW_HEAD: ${{ steps.replay.outputs.new_head }}
+        run: |
+          git push --force origin "$OLD_HEAD:refs/heads/$ROLLBACK"
+          git push --force-with-lease="refs/heads/$TARGET:$OLD_HEAD" origin "$NEW_HEAD:refs/heads/$TARGET"
+          {
+            echo "### Published"
+            echo "- \`$TARGET\`: \`$OLD_HEAD\` -> \`$NEW_HEAD\`"
+            echo "- rollback: \`$ROLLBACK\` = \`$OLD_HEAD\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Close conflict issue
+        if: success() && steps.plan.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title \
+                     --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number"); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Resolved: $TARGET is now ${{ steps.replay.outputs.new_head }} on upstream $UPSTREAM."
+          done
+
+      - name: Report conflict
+        if: failure() && steps.replay.outputs.conflict != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT: ${{ steps.replay.outputs.conflict }}
+          SUBJECT: ${{ steps.replay.outputs.subject }}
+          FILES: ${{ steps.replay.outputs.files }}
+        run: |
+          body=$(cat <<EOF
+          Upstream staging \`$UPSTREAM\` could not be combined with Logan's commits.
+
+          - conflicting commit: \`$CONFLICT\` $SUBJECT
+          - conflicted files:
+          $(printf '%s\n' "$FILES" | sed 's/^/  - /')
+          - run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          \`$TARGET\` was left unchanged. Rebase the commit by hand onto upstream staging, push \`$TARGET\`, and rerun the workflow.
+          EOF
+          )
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title \
+                --jq ".[] | select(.title == \"$ISSUE_TITLE\") | .number" | head -1)
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" --body "$body"
+          fi

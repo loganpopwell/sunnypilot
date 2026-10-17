@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 import openpilot.system.loggerd.deleter as deleter
 from openpilot.system.loggerd.tests.loggerd_tests_common import UploaderTestCase
+from openpilot.system.loggerd.xattr_cache import setxattr
 
 Stats = namedtuple("Stats", ['f_bavail', 'f_blocks', 'f_frsize'])
 
@@ -61,6 +62,26 @@ class TestDeleter(UploaderTestCase):
       self.make_file_with_data(self.seg_format.format(0), self.f_type, preserve_xattr=deleter.PRESERVE_ATTR_VALUE),
       self.make_file_with_data("boot", self.seg_format[:-4]),
       self.make_file_with_data("crash", self.seg_format2[:-4]),
+    ])
+
+  def backed_up(self, f_path: Path) -> Path:
+    setxattr(str(f_path), deleter.BACKED_UP_ATTR_NAME, deleter.BACKED_UP_ATTR_VALUE)
+    return f_path
+
+  def test_delete_backed_up_first(self):
+    self.assertDeleteOrder([
+      self.backed_up(self.make_file_with_data(self.seg_format.format(1), self.f_type)),
+      self.backed_up(self.make_file_with_data(self.seg_format2.format(0), self.f_type)),
+      self.make_file_with_data(self.seg_format.format(0), self.f_type),
+      self.make_file_with_data(self.seg_format.format(2), self.f_type),
+      self.make_file_with_data(self.seg_format2.format(1), self.f_type),
+    ])
+
+  def test_delete_preserved_after_unbacked(self):
+    self.assertDeleteOrder([
+      self.make_file_with_data(self.seg_format2.format(0), self.f_type),
+      self.backed_up(self.make_file_with_data(self.seg_format.format(0), self.f_type, preserve_xattr=deleter.PRESERVE_ATTR_VALUE)),
+      self.make_file_with_data("boot", self.seg_format[:-4]),
     ])
 
   def test_no_delete_when_available_space(self):

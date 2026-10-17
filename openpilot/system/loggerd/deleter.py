@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import errno
 import os
 import time
 import shutil
@@ -8,7 +9,7 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.loggerd.config import get_available_bytes, get_available_percent
 from openpilot.system.loggerd.uploader import listdir_by_creation
-from openpilot.system.loggerd.xattr_cache import getxattr
+from openpilot.system.loggerd.xattr_cache import getxattr, _getxattr
 
 MIN_BYTES = 5 * 1024 * 1024 * 1024
 MIN_PERCENT = 10
@@ -18,6 +19,64 @@ DELETE_LAST = ['boot', 'crash']
 PRESERVE_ATTR_NAME = 'user.preserve'
 PRESERVE_ATTR_VALUE = b'1'
 PRESERVE_COUNT = 5
+
+# Set by phone_relay (POST /v1/backed-up) once the iPhone reports the file verified on the homelab.
+BACKED_UP_ATTR_NAME = 'user.phone_relay.backed_up'
+BACKED_UP_ATTR_VALUE = b'1'
+# The files the phone copies. rlog and dcamera stay on the comma only and don't count.
+BACKED_UP_FILES = ('qlog.zst', 'qcamera.ts', 'fcamera.hevc', 'ecamera.hevc')
+
+# Segments seen fully backed up. Files in a closed segment never change, so this only grows
+# (pruned to the directories that still exist).
+_backed_up_dirs: set[str] = set()
+
+
+def _has_backed_up_xattr(path: str) -> bool:
+  # Uncached: phone_relay sets this from another process while the deleter runs.
+  try:
+    return _getxattr(path, BACKED_UP_ATTR_NAME) == BACKED_UP_ATTR_VALUE
+  except OSError as e:
+    if e.errno not in (errno.ENODATA, getattr(errno, 'ENOATTR', errno.ENODATA)):
+      cloudlog.exception(f"issue reading backup state of {path}")
+    return False
+
+
+def is_backed_up(d: str) -> bool:
+  """True when the segment has at least one phone-copied file and every one present is marked backed up."""
+  seg_path = os.path.join(Paths.log_root(), d)
+  found = False
+  for name in BACKED_UP_FILES:
+    path = os.path.join(seg_path, name)
+    if not os.path.isfile(path):
+      continue
+    if not _has_backed_up_xattr(path):
+      return False
+    found = True
+  return found
+
+
+def get_backed_up_segments(dirs: list[str]) -> set[str]:
+  global _backed_up_dirs
+  _backed_up_dirs &= set(dirs)
+  for d in dirs:
+    if d not in _backed_up_dirs and d not in DELETE_LAST and is_backed_up(d):
+      _backed_up_dirs.add(d)
+  return set(_backed_up_dirs)
+
+
+def deletion_order(dirs_by_creation: list[str]) -> list[str]:
+  """Oldest first within each group: backed up, then not backed up (last resort so recording never
+  stops), then preserved segments, then boot/crash logs."""
+  preserved_dirs = get_preserved_segments(dirs_by_creation)
+  backed_up_dirs = get_backed_up_segments(dirs_by_creation)
+  return sorted(dirs_by_creation, key=lambda d: (d in DELETE_LAST, d in preserved_dirs, d not in backed_up_dirs))
+
+
+def _log_delete(delete_dir: str, delete_path: str, backed_up_dirs: set[str]) -> None:
+  if delete_dir in backed_up_dirs or delete_dir in DELETE_LAST:
+    cloudlog.info(f"deleting {delete_path}")
+  else:
+    cloudlog.warning(f"deleting {delete_path} (not backed up to the phone)")
 
 
 def has_preserve_xattr(d: str) -> bool:
@@ -55,17 +114,16 @@ def deleter_step() -> tuple[bool, str | None]:
     return False, None
 
   dirs = listdir_by_creation(Paths.log_root())
-  preserved_dirs = get_preserved_segments(dirs)
 
-  # remove the earliest directory we can
-  for delete_dir in sorted(dirs, key=lambda d: (d in DELETE_LAST, d in preserved_dirs)):
+  # remove the earliest directory we can, backed-up footage first
+  for delete_dir in deletion_order(dirs):
     delete_path = os.path.join(Paths.log_root(), delete_dir)
 
     if any(name.endswith(".lock") for name in os.listdir(delete_path)):
       continue
 
     try:
-      cloudlog.info(f"deleting {delete_path}")
+      _log_delete(delete_dir, delete_path, _backed_up_dirs)
       shutil.rmtree(delete_path)
       return True, delete_path
     except OSError:
@@ -80,10 +138,9 @@ def deleter_thread(exit_event: threading.Event):
 
     if out_of_percent or out_of_bytes:
       dirs = listdir_by_creation(Paths.log_root())
-      preserved_dirs = get_preserved_segments(dirs)
 
-      # remove the earliest directory we can
-      for delete_dir in sorted(dirs, key=lambda d: (d in DELETE_LAST, d in preserved_dirs)):
+      # remove the earliest directory we can, backed-up footage first
+      for delete_dir in deletion_order(dirs):
         delete_path = os.path.join(Paths.log_root(), delete_dir)
 
         if any(name.endswith(".lock") for name in os.listdir(delete_path)):
@@ -125,7 +182,7 @@ def deleter_thread(exit_event: threading.Event):
           continue
 
         try:
-          cloudlog.info(f"deleting {delete_path}")
+          _log_delete(delete_dir, delete_path, _backed_up_dirs)
           shutil.rmtree(delete_path)
           break
         except OSError:

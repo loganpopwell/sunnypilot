@@ -18,7 +18,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .common import FILE, MAX_FILE, atomic_json
 
 
-SERVED = ('qlog.zst', 'fcamera.hevc', 'ecamera.hevc')
+# qcamera.ts is small (~2 MB/min) and carries the microphone track when Record Audio is on.
+SERVED = ('qlog.zst', 'fcamera.hevc', 'ecamera.hevc', 'qcamera.ts')
 # Bytes/s shared by every read while driving. Both cameras record ~1.2 MB/s and each file is read twice
 # (hash, then send), so this leaves room to catch up on a backlog.
 ONROAD_RATE = 8 * 1024 * 1024

@@ -288,18 +288,21 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
             self.end_headers()
             self.wfile.write(data)
         def do_POST(self):
-            if not self.authorized():
-                return
+            # The (bounded) body is read before answering, even a 401, so the client sees the
+            # status instead of a reset connection.
             try:
-                if urlsplit(self.path).path != '/v1/backed-up':
-                    self.send_error(404)
-                    return
                 length = int(self.headers.get('Content-Length', ''))
                 if not 0 < length <= MAX_BODY:
                     self.close_connection = True
-                    self.send_error(413)
+                    self.send_error(413 if length > MAX_BODY else 400)
                     return
-                body = json.loads(self.rfile.read(length))
+                raw = self.rfile.read(length)
+                if not self.authorized():
+                    return
+                if urlsplit(self.path).path != '/v1/backed-up':
+                    self.send_error(404)
+                    return
+                body = json.loads(raw)
                 if not isinstance(body, dict):
                     raise ValueError()
                 self.send_json(store.mark_backed_up(body.get('files')))

@@ -1,14 +1,17 @@
-"""Read-only TLS file server. Disabled without external pairing configuration.
+"""TLS file server for the phone. Disabled without external pairing configuration.
 
+Read-only except for one write: an xattr marking a closed file as backed up (POST /v1/backed-up).
 Only closed logger segments (no .lock files), bounded requests, no Param writes.
 While driving, all reads (hashing and transfers) share a low byte-rate budget.
 """
+import errno
 import hashlib
 import hmac
 import json
 import os
 import ssl
 import stat
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -23,6 +26,52 @@ SERVED = ('qlog.zst', 'fcamera.hevc', 'ecamera.hevc', 'qcamera.ts')
 # Bytes/s shared by every read while driving. Both cameras record ~1.2 MB/s and each file is read twice
 # (hash, then send), so this leaves room to catch up on a backlog.
 ONROAD_RATE = 8 * 1024 * 1024
+# Set by the phone (POST /v1/backed-up) once the homelab has verified a file. The deleter removes
+# segments whose served files all carry it before touching footage that exists only on the comma.
+BACKED_UP_ATTR = 'user.phone_relay.backed_up'
+BACKED_UP_VALUE = b'1'
+MAX_BACKED_UP = 5000
+MAX_BODY = 1024 * 1024
+
+if sys.platform == 'darwin':  # tests on a Mac; the comma is Linux and uses os.*xattr
+    import ctypes
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _libc.fsetxattr.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    _libc.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    _libc.getxattr.restype = ctypes.c_ssize_t
+
+    def _fsetxattr(fd, name, value):
+        if _libc.fsetxattr(fd, name.encode(), value, len(value), 0, 0) == -1:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+
+    def _getxattr(path, name):
+        buf = ctypes.create_string_buffer(16)
+        n = _libc.getxattr(os.fsencode(path), name.encode(), buf, 16, 0, 1)  # XATTR_NOFOLLOW
+        if n == -1:
+            e = ctypes.get_errno()
+            if e == errno.ENOATTR:
+                return None
+            raise OSError(e, os.strerror(e))
+        return buf.raw[:n]
+else:
+    def _fsetxattr(fd, name, value):
+        os.setxattr(fd, name, value)
+
+    def _getxattr(path, name):
+        try:
+            return os.getxattr(path, name, follow_symlinks=False)
+        except OSError as e:
+            if e.errno == errno.ENODATA:
+                return None
+            raise
+
+
+def is_backed_up(path):
+    try:
+        return _getxattr(path, BACKED_UP_ATTR) == BACKED_UP_VALUE
+    except OSError:
+        return False
 
 
 class Budget:
@@ -60,9 +109,7 @@ class RecordingStore:
         if not FILE.fullmatch(name) or name.split('/')[1] not in self.served:
             raise FileNotFoundError()
         segment, filename = name.split('/')
-        directory = self.root / segment
-        if directory.is_symlink() or (directory / '.lock').exists() or list(directory.glob('*.lock')):
-            raise FileNotFoundError()
+        directory = self._closed_dir(segment)
         fd = os.open(directory / filename, os.O_RDONLY | os.O_NOFOLLOW)
         f = os.fdopen(fd, 'rb')
         info = os.fstat(fd)
@@ -70,6 +117,60 @@ class RecordingStore:
             f.close()
             raise FileNotFoundError()
         return f
+
+    def _closed_dir(self, segment):
+        directory = self.root / segment
+        if directory.is_symlink() or (directory / '.lock').exists() or list(directory.glob('*.lock')):
+            raise FileNotFoundError()
+        return directory
+
+    def mark_backed_up(self, entries):
+        """Tag files the phone reports as verified on the homelab. Only exact, current, closed files."""
+        if not isinstance(entries, list) or len(entries) > MAX_BACKED_UP:
+            raise ValueError()
+        marked = rejected = 0
+        for entry in entries:
+            try:
+                if not isinstance(entry, dict) or type(entry.get('size')) is not int or not isinstance(entry.get('path'), str):
+                    raise ValueError()
+                name = entry['path']
+                if not FILE.fullmatch(name) or name.split('/')[1] not in self.served:
+                    raise ValueError()
+                segment, filename = name.split('/')
+                directory = self._closed_dir(segment)
+                fd = os.open(directory / filename, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != entry['size'] or not 0 < info.st_size <= MAX_FILE:
+                        raise ValueError()
+                    _fsetxattr(fd, BACKED_UP_ATTR, BACKED_UP_VALUE)
+                finally:
+                    os.close(fd)
+                marked += 1
+            except (ValueError, OSError):
+                rejected += 1
+        return {'marked': marked, 'rejected': rejected}
+
+    def backup_summary(self, segments):
+        """Footage that exists only on the comma. One getxattr per served file, no reads."""
+        unbacked_segments = unbacked_bytes = unbacked_files = backed_up_bytes = 0
+        for directory in segments:
+            missing = False
+            for filename in self.served:
+                path = directory / filename
+                try:
+                    size = path.lstat().st_size
+                except OSError:
+                    continue
+                if is_backed_up(path):
+                    backed_up_bytes += size
+                else:
+                    missing = True
+                    unbacked_files += 1
+                    unbacked_bytes += size
+            unbacked_segments += missing
+        return {'unbacked_segments': unbacked_segments, 'unbacked_files': unbacked_files,
+                'unbacked_bytes': unbacked_bytes, 'backed_up_bytes': backed_up_bytes}
 
     def status(self):
         """Small summary for the phone's test mode. No file contents, no hashing."""
@@ -81,7 +182,7 @@ class RecordingStore:
         return {'onroad': bool(self.budget.onroad()), 'recording': recording, 'segments': len(segments),
                 'newest': newest.name if newest else None, 'newest_mtime': newest.stat().st_mtime if newest else None,
                 'free_bytes': usage.f_bavail * usage.f_frsize, 'served': list(self.served),
-                'onroad_rate': self.budget.rate, 'time': time.time()}
+                'onroad_rate': self.budget.rate, 'time': time.time(), **self.backup_summary(segments)}
 
     def manifest(self, offset=0):
         # Pagination is stable for a stationary recording directory; repeated scans dedupe by hash.
@@ -172,10 +273,43 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
             self.connection.settimeout(30)
         def log_message(self, *_):
             pass
-        def do_GET(self):
+        def authorized(self):
             auth = self.headers.get('Authorization', '')
             if not auth.startswith('Bearer ') or not hmac.compare_digest(hashlib.sha256(auth[7:].encode()).hexdigest(), token_hash):
                 self.send_error(401)
+                return False
+            return True
+        def send_json(self, value):
+            data = json.dumps(value).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+        def do_POST(self):
+            if not self.authorized():
+                return
+            try:
+                if urlsplit(self.path).path != '/v1/backed-up':
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get('Content-Length', ''))
+                if not 0 < length <= MAX_BODY:
+                    self.close_connection = True
+                    self.send_error(413)
+                    return
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError()
+                self.send_json(store.mark_backed_up(body.get('files')))
+            except ValueError:  # includes malformed JSON and a missing Content-Length
+                self.close_connection = True
+                self.send_error(400)
+            except (OSError, TimeoutError):
+                self.close_connection = True
+        def do_GET(self):
+            if not self.authorized():
                 return
             try:
                 url = urlsplit(self.path)
@@ -183,24 +317,12 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                     value = store.status()
                     value['wifi'] = wifi_state() if wifi_state else None
                     value['active_connections'] = server_slots() if server_slots else None
-                    data = json.dumps(value).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(data)))
-                    self.send_header('Cache-Control', 'no-store')
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self.send_json(value)
                 elif url.path == '/v1/manifest':
                     offset = int(parse_qs(url.query).get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
                         raise ValueError()
-                    data = json.dumps(store.manifest(offset)).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(data)))
-                    self.send_header('Cache-Control', 'no-store')
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self.send_json(store.manifest(offset))
                 elif url.path.startswith('/v1/files/'):
                     with store.open_file(unquote(url.path[len('/v1/files/'):])) as f:
                         info = os.fstat(f.fileno())

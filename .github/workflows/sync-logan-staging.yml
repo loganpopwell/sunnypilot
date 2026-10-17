@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: '23 1,7,13,19 * * *'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Replay and test onto upstream staging even if it is unchanged, without pushing
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -45,6 +50,8 @@ jobs:
 
       - name: Find the current base build and Logan's commits
         id: plan
+        env:
+          DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
           old_head=$(git rev-parse HEAD)
           base=$(git log -1 --format=%H --author='github-actions[bot]' --fixed-strings --grep='(staging)' HEAD)
@@ -66,7 +73,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$(git rev-parse "$base^{tree}")" = "$(git rev-parse "$UPSTREAM^{tree}")" ]; then
             echo "Upstream staging is unchanged; nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "update=$DRY_RUN" >> "$GITHUB_OUTPUT"
           else
             echo "update=true" >> "$GITHUB_OUTPUT"
           fi
@@ -106,10 +113,11 @@ jobs:
           [ -s ../changed.txt ] && xargs -a ../changed.txt python3 -m py_compile
           python3 -m unittest -v \
             openpilot.system.loggerd.tests.test_deleter_backup \
-            openpilot.sunnypilot.phone_relay.tests.test_backed_up
+            openpilot.sunnypilot.phone_relay.tests.test_backed_up \
+            openpilot.sunnypilot.phone_relay.tests.test_streaming
 
       - name: Publish
-        if: steps.plan.outputs.update == 'true'
+        if: steps.plan.outputs.update == 'true' && inputs.dry_run != true
         env:
           OLD_HEAD: ${{ steps.plan.outputs.old_head }}
           NEW_HEAD: ${{ steps.replay.outputs.new_head }}
@@ -123,7 +131,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Close conflict issue
-        if: success() && steps.plan.outputs.update == 'true'
+        if: success() && steps.plan.outputs.update == 'true' && inputs.dry_run != true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

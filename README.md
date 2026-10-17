@@ -15,4 +15,6 @@ that runs on the comma is on `logan-staging`.
 5. Saves the old head as `logan-staging-prev`, then force-pushes (with lease) the result to
    `logan-staging`. The comma's updater picks it up from there.
 
+Run it by hand with **dry_run** to replay and test onto the current upstream build without pushing.
+
 Roll back: `git push --force origin origin/logan-staging-prev:logan-staging`.

@@ -1,8 +1,13 @@
 """TLS file server for the phone. Disabled without external pairing configuration.
 
-Read-only except for one write: an xattr marking a closed file as backed up (POST /v1/backed-up).
-Only closed logger segments (no .lock files), bounded requests, no Param writes.
-While driving, all reads share a low byte-rate budget. Files are never read just to hash them while
+Read-only except for two writes: an xattr marking a closed file as backed up (POST /v1/backed-up), and
+an urgent grab (POST /v1/grab), which locks the last few minutes with user.preserve and logs a "grab"
+event exactly like event_lockd does. Bounded requests, no Param writes.
+Only closed logger segments (no .lock files) are served, hashed or marked, except that the camera files
+of the segment still recording may be read: a read-only snapshot of the bytes written so far
+(X-Comma-Partial: 1), never hashed, never cached, never marked. Logs stay closed-only.
+While driving, all reads share a low byte-rate budget; for GRAB_WINDOW_S after a grab, reads of the
+grabbed segments share a higher one instead. Files are never read just to hash them while
 listing: a file's SHA-256 is computed from the bytes as they are sent to the phone, kept per resumed
 download, and cached on disk once the whole file has gone out. GET /v1/hash/<path> returns it.
 """
@@ -23,7 +28,7 @@ from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 from .common import FILE, MAX_FILE, atomic_json
-from .event_lock import EVENTS_PATH, is_locked, read_events
+from .event_lock import EVENTS_PATH, Recorder, is_locked, read_events
 
 
 # qcamera.ts is small (~2 MB/min) and carries the microphone track when Record Audio is on.
@@ -31,6 +36,19 @@ SERVED = ('qlog.zst', 'fcamera.hevc', 'ecamera.hevc', 'qcamera.ts')
 # Bytes/s shared by every read while driving. Both cameras record ~1.3 MB/s together and each file is
 # read once (hashed while it is sent), so this leaves room to catch up on a backlog.
 ONROAD_RATE = 8 * 1024 * 1024
+# Bytes/s shared by reads of a grab's segments for GRAB_WINDOW_S after POST /v1/grab, instead of
+# ONROAD_RATE. Measured on the comma 4 (2026-11-10, nice 19, idle I/O class): reading camera files and
+# sending them over TLS 1.3 (AES-256-GCM) costs ~8.5-10.5 ms of CPU per MiB, so this is ~0.3 of one of
+# 8 cores (~4% of the CPU); unthrottled it ran at ~72 MiB/s on 0.6 cores. ~200 MB takes ~6 s here,
+# so the phone's Wi-Fi link, not this, is the limit.
+GRAB_RATE = 32 * 1024 * 1024
+GRAB_WINDOW_S = 10 * 60
+GRAB_MINUTES = (1, 15, 5)  # min, max, default
+SEGMENT_S = 60
+# Camera files of the recording segment a grab may read while loggerd is still writing them.
+# Logs stay closed-only: they are compressed in frames and a cut-off tail is useless.
+PARTIAL_OK = ('qcamera.ts', 'fcamera.hevc', 'ecamera.hevc')
+GRAB_FILES = ('qcamera.ts', 'fcamera.hevc', 'ecamera.hevc', 'qlog.zst', 'rlog.zst')
 # Requests that read file contents (downloads, /v1/hash) share these. Status, manifest and
 # /v1/backed-up have their own, so they always get through while downloads are busy.
 DOWNLOAD_SLOTS = 4
@@ -119,11 +137,31 @@ def stamp(info):
     return [info.st_ino, info.st_size, info.st_mtime_ns]
 
 
+def segment_key(name):
+    route, number = name.rsplit('--', 1)
+    return route, int(number)
+
+
+def recording(directory):
+    """True while loggerd still has a file in this segment open."""
+    try:
+        return any(n.endswith('.lock') for n in os.listdir(directory))
+    except OSError:
+        return False
+
+
 class RecordingStore:
-    def __init__(self, root, onroad=lambda: False, served=SERVED, cache=None, events=None):
+    def __init__(self, root, onroad=lambda: False, served=SERVED, cache=None, events=None, now=time.time,
+                 mono=time.monotonic):
         self.root = Path(root).resolve()
         self.events_path = Path(events) if events else None  # event_lockd's log
         self.budget = Budget(onroad)
+        self.grab_budget = Budget(onroad, GRAB_RATE)
+        self.now, self.mono = now, mono
+        self.grab_lock = threading.Lock()
+        self.grabbed = {}  # segment name -> monotonic time its grab budget ends
+        self.recorder = Recorder(self.root, self.events_path)  # locks and events.jsonl, as event_lockd does
+        self.pending_thread = None
         self.served = tuple(served)
         # Digests keyed by path, valid while (inode, size, mtime) match: {path: [ino, size, mtime_ns, sha256]}.
         self.cache_path = Path(cache) if cache else None
@@ -202,12 +240,13 @@ class RecordingStore:
             key = (name, *stamp(info))
             with self.lock:
                 state = self.partials.pop(key, None) or StreamHash()
+            budget = self.budget_for(name)
             try:
                 f.seek(state.offset)
                 for block in iter(lambda: f.read(1024 * 1024), b''):
                     if client_gone():
                         raise TimeoutError()
-                    self.budget.take(len(block))
+                    budget.take(len(block))
                     state.feed(state.offset, block)
                 if state.offset != info.st_size or stamp(os.fstat(f.fileno())) != stamp(info):
                     raise FileNotFoundError()  # changed underneath us; closed segments never do
@@ -218,18 +257,139 @@ class RecordingStore:
             self._store_digest(name, info, sha)
             return info, sha
 
-    def open_file(self, name):
+    def open_file(self, name, partial_ok=False):
+        """A served file of a closed segment. With partial_ok, also a camera file of a segment that is
+        still recording; then f.partial is True and the caller must read only the first fstat size
+        bytes, and never hash or mark it."""
         if not FILE.fullmatch(name) or name.split('/')[1] not in self.served:
             raise FileNotFoundError()
         segment, filename = name.split('/')
-        directory = self._closed_dir(segment)
+        partial = False
+        try:
+            directory = self._closed_dir(segment)
+        except FileNotFoundError:
+            directory = self.root / segment
+            if not (partial_ok and filename in PARTIAL_OK) or directory.is_symlink() or not directory.is_dir():
+                raise
+            partial = True
         fd = os.open(directory / filename, os.O_RDONLY | os.O_NOFOLLOW)
         f = os.fdopen(fd, 'rb')
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_FILE:
             f.close()
             raise FileNotFoundError()
+        # Decided after opening: a segment that closed meanwhile is still served as a snapshot, never the reverse.
+        f.partial = partial
         return f
+
+    def budget_for(self, name):
+        """The grab budget for a grabbed segment within GRAB_WINDOW_S, else the shared one."""
+        with self.grab_lock:
+            until = self.grabbed.get(name.split('/')[0])
+        return self.grab_budget if until is not None and self.mono() < until else self.budget
+
+    def grab_active(self):
+        now = self.mono()
+        with self.grab_lock:
+            return any(until > now for until in self.grabbed.values())
+
+    def _segment_end(self, directory):
+        """Wall time a segment's footage ends: now while recording, else its newest file's mtime."""
+        if recording(directory):
+            return self.now()
+        times = []
+        for name in GRAB_FILES:
+            try:
+                times.append((directory / name).stat().st_mtime)
+            except OSError:
+                pass
+        return max(times) if times else directory.stat().st_mtime  # not the directory's: markers move it
+
+    def grab(self, minutes):
+        """Lock the segments covering the last `minutes` of the current (or, offroad, the latest) route,
+        log a "grab" event and open the grab budget for them. Only stat/xattr/small writes: no reads."""
+        lo, hi, _ = GRAB_MINUTES
+        if type(minutes) is not int or not lo <= minutes <= hi:
+            raise ValueError()
+        routes = {}  # route -> its segment numbers; names only (one directory listing, no stats)
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                if FILE.fullmatch(entry.name + '/qlog.zst') and entry.is_dir(follow_symlinks=False):
+                    route, number = segment_key(entry.name)
+                    routes.setdefault(route, []).append(number)
+        if not routes:
+            raise FileNotFoundError()
+        # Current route: the recording one, else the one whose log was written last (route names don't
+        # all sort by time, and directory mtimes move when markers are written). One check per route.
+        def written(route):
+            p = self.root / f'{route}--{max(routes[route])}'
+            try:
+                return recording(p), (p / 'qlog.zst').stat().st_mtime
+            except OSError:
+                return recording(p), p.stat().st_mtime
+        route = max(routes, key=written)
+        numbers = sorted(routes[route])
+        last = numbers[-1]
+        live = recording(self.root / f'{route}--{last}')
+        end = self._segment_end(self.root / f'{route}--{last}')
+        since = end - minutes * 60
+        chosen = []
+        for n in reversed(numbers[-(minutes + 3):]):
+            directory = self.root / f'{route}--{n}'
+            if chosen and self._segment_end(directory) <= since:  # ended before the window
+                break
+            chosen.append(n)
+        chosen.reverse()
+        names = [f'{route}--{n}' for n in chosen]
+        lock_names = names + ([f'{route}--{last + 1}'] if live else [])  # the next segment, once loggerd opens it
+
+        try:  # loggerd creates rlog.lock when it opens the segment
+            started = (self.root / f'{route}--{last}' / 'rlog.lock').stat().st_mtime if live else end - SEGMENT_S
+        except OSError:
+            started = end - SEGMENT_S
+        wall_ms = int(round(self.now() * 1000))
+        marker = Recorder.marker({'kind': 'grab', 'peak_g': None, 'speed_mph': None}, route, last,
+                                 round(max(0.0, end - started), 2), wall_ms, lock_names)
+        with self.grab_lock:
+            self.recorder.lock_all(lock_names, self.mono)
+            until = self.mono() + GRAB_WINDOW_S
+            for name in lock_names:
+                self.grabbed[name] = max(self.grabbed.get(name, 0.0), until)
+            for name in [k for k, v in self.grabbed.items() if v < self.mono()]:
+                del self.grabbed[name]
+            if self.recorder.pending and (self.pending_thread is None or not self.pending_thread.is_alive()):
+                self.pending_thread = threading.Thread(target=self._apply_pending, daemon=True)
+                self.pending_thread.start()
+        self.recorder.write(marker)
+
+        segments = []
+        for name in names:
+            directory = self.root / name
+            files = {}
+            for filename in GRAB_FILES:
+                try:
+                    info = (directory / filename).lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                lock = 'rlog' if filename.endswith('log.zst') else filename
+                files[filename] = {'size': info.st_size, 'closed': not (directory / f'{lock}.lock').exists()}
+            segments.append({'name': name, 'recording': recording(directory), 'files': files})
+        return {'route': route, 'event_id': marker['id'], 'segments': segments}
+
+    def _apply_pending(self):
+        """Lock the after-segment of a grab once loggerd opens it (gives up after PENDING_LOCK_S)."""
+        while True:
+            with self.grab_lock:
+                try:
+                    self.recorder.apply_pending(self.mono)
+                except Exception:
+                    self.recorder.pending.clear()
+                if not self.recorder.pending:
+                    self.pending_thread = None
+                    return
+            time.sleep(1)
 
     def _closed_dir(self, segment):
         directory = self.root / segment
@@ -305,7 +465,8 @@ class RecordingStore:
         return {'onroad': bool(self.budget.onroad()), 'recording': recording, 'segments': len(segments),
                 'newest': newest.name if newest else None, 'newest_mtime': newest.stat().st_mtime if newest else None,
                 'free_bytes': usage.f_bavail * usage.f_frsize, 'served': list(self.served),
-                'onroad_rate': self.budget.rate, 'time': time.time(), **self.backup_summary(segments)}
+                'onroad_rate': self.budget.rate, 'grab_active': self.grab_active(), 'grab_rate': self.grab_budget.rate,
+                'time': time.time(), **self.backup_summary(segments)}
 
     def events(self):
         """Events logged by event_lockd, newest first."""
@@ -442,15 +603,16 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
             # The (bounded) body is read before answering, even a 401, so the client sees the
             # status instead of a reset connection.
             try:
-                length = int(self.headers.get('Content-Length', ''))
-                if not 0 < length <= MAX_BODY:
+                path = urlsplit(self.path).path
+                length = int(self.headers.get('Content-Length', '0' if path == '/v1/grab' else ''))
+                if not (0 if path == '/v1/grab' else 1) <= length <= MAX_BODY:
                     self.close_connection = True
                     self.send_error(413 if length > MAX_BODY else 400)
                     return
-                raw = self.rfile.read(length)
+                raw = self.rfile.read(length) if length else b'{}'
                 if not self.authorized():
                     return
-                if urlsplit(self.path).path != '/v1/backed-up':
+                if path not in ('/v1/backed-up', '/v1/grab'):
                     self.send_error(404)
                     return
                 body = json.loads(raw)
@@ -460,7 +622,15 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                 if release is None:
                     return
                 try:
-                    self.send_json(store.mark_backed_up(body.get('files')))
+                    if path == '/v1/grab':
+                        try:
+                            value = store.grab(body.get('minutes', GRAB_MINUTES[2]))
+                        except FileNotFoundError:
+                            self.send_error(404)
+                            return
+                        self.send_json(value)
+                    else:
+                        self.send_json(store.mark_backed_up(body.get('files')))
                 finally:
                     release()
             except ValueError:  # includes malformed JSON and a missing Content-Length
@@ -496,18 +666,22 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                     self.send_json(store.manifest(offset))
                 elif url.path.startswith('/v1/hash/'):
                     name = unquote(url.path[len('/v1/hash/'):])
-                    info, sha = store.digest(name, self.client_gone)
+                    info, sha = store.digest(name, self.client_gone)  # closed files only
                     self.send_json({'path': name, 'size': info.st_size, 'mtime': info.st_mtime_ns / 1e9, 'sha256': sha})
                 elif url.path.startswith('/v1/files/'):
                     name = unquote(url.path[len('/v1/files/'):])
-                    with store.open_file(name) as f:
+                    with store.open_file(name, partial_ok=True) as f:
                         info = os.fstat(f.fileno())
-                        size = info.st_size
+                        size = info.st_size  # for a partial file: the snapshot, exactly what is sent
                         etag = '"' + hashlib.sha256(f'{info.st_ino}:{size}:{info.st_mtime_ns}'.encode()).hexdigest() + '"'
+                        # A recording file only grows, so a resume keeps its range across snapshots and after it closes.
+                        growing = '"p-' + hashlib.sha256(f'{info.st_ino}:{name}'.encode()).hexdigest() + '"'
+                        if f.partial:
+                            etag = growing
                         start, end = 0, size - 1
                         status = 200
                         value = self.headers.get('Range')
-                        if self.headers.get('If-Range', etag) != etag:
+                        if self.headers.get('If-Range', etag) not in (etag, growing):
                             value = None
                         if value:
                             import re
@@ -516,7 +690,13 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                                 raise ValueError()
                             start = int(match[1]); end = min(int(match[2]), size-1) if match[2] else size-1
                             if start > end:
-                                self.send_error(416); return
+                                self.send_response(416)
+                                self.send_header('Content-Range', f'bytes */{size}')
+                                self.send_header('Content-Length', '0')
+                                if f.partial:
+                                    self.send_header('X-Comma-Partial', '1')
+                                self.end_headers()
+                                return
                             status = 206
                         self.send_response(status)
                         self.send_header('Content-Type', 'application/octet-stream')
@@ -525,12 +705,16 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                         self.send_header('ETag', etag)
                         self.send_header('Cache-Control', 'no-store')
                         if status == 206:
-                            self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
-                        known = store.cached_digest(name, info)
+                            self.send_header('Content-Range', f'bytes {start}-{end}/{"*" if f.partial else size}')
+                        if f.partial:
+                            self.send_header('X-Comma-Partial', '1')
+                            self.send_header('X-Comma-Snapshot-Size', str(size))
+                        known = None if f.partial else store.cached_digest(name, info)
                         if known:
                             self.send_header('X-Content-SHA256', known)  # whole file, also for ranges
                         self.end_headers()
-                        state = store.begin_stream(name, info, start)
+                        state = None if f.partial else store.begin_stream(name, info, start)  # never hash a partial file
+                        budget = store.budget_for(name)
                         try:
                             f.seek(start)
                             pos, remaining = start, end-start+1
@@ -543,7 +727,7 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                                     state.feed(pos, block)  # counted only after it was handed to the socket
                                 pos += len(block)
                                 remaining -= len(block)
-                                store.budget.take(len(block))
+                                budget.take(len(block))
                         finally:
                             store.end_stream(name, info, state)
                 else:

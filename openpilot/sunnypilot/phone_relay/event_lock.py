@@ -36,7 +36,9 @@ SETTLE_S = 0.5
 GAP_S = 0.5  # a longer gap in a sensor stream restarts its windows
 GPS_MAX_AGE_S = 2.0
 
-KINDS = ('impact', 'speed_jump', 'hard_brake', 'bookmark')  # most to least severe
+# Most to least severe. grab: the phone asked for the last few minutes (POST /v1/grab on the relay); it
+# never replaces another event's marker.
+KINDS = ('impact', 'speed_jump', 'hard_brake', 'bookmark', 'grab')
 LOCK_BEFORE = 2
 LOCK_AFTER = 1
 PRESERVE_ATTR_NAME = 'user.preserve'  # same as the deleter and loggerd
@@ -214,7 +216,7 @@ class Recorder:
 
   def __init__(self, root=LOG_ROOT, events_path=EVENTS_PATH, log=None):
     self.root = Path(root)
-    self.events_path = Path(events_path)
+    self.events_path = Path(events_path) if events_path else None  # None: no events.jsonl
     self.log = log
     self.pending = {}  # segment dir name -> monotonic deadline
 
@@ -222,37 +224,53 @@ class Recorder:
     if self.log is not None:
       self.log.exception(f'event_lockd: {what}')
 
-  def record(self, event, route, segment, offset_s, wall_ms, mono=time.monotonic):
-    first = max(0, segment - LOCK_BEFORE)
-    names = [f'{route}--{n}' for n in range(first, segment + LOCK_AFTER + 1)]
-    marker = {'v': 1, 'id': f'{route}--{segment}--{wall_ms}', 'kind': event['kind'], 'wall_time': iso_utc(wall_ms),
-              'route': route, 'segment': segment, 'offset_s': float(offset_s), 'peak_g': event.get('peak_g'),
-              'speed_mph': event.get('speed_mph'), 'segments': names}
+  @staticmethod
+  def marker(event, route, segment, offset_s, wall_ms, names=None):
+    """The contract's event.json. names: segments to lock, default the 2 before to the 1 after."""
+    if names is None:
+      names = [f'{route}--{n}' for n in range(max(0, segment - LOCK_BEFORE), segment + LOCK_AFTER + 1)]
+    return {'v': 1, 'id': f'{route}--{segment}--{wall_ms}', 'kind': event['kind'], 'wall_time': iso_utc(wall_ms),
+            'route': route, 'segment': segment, 'offset_s': float(offset_s), 'peak_g': event.get('peak_g'),
+            'speed_mph': event.get('speed_mph'), 'segments': list(names)}
+
+  def lock_all(self, names, mono=time.monotonic):
+    """Lock each segment now, or once it appears (an after-segment loggerd hasn't opened yet)."""
     for name in names:
       try:
         if not lock(self.root / name):
           self.pending[name] = mono() + PENDING_LOCK_S
       except OSError:
         self._error(f'lock {name}')
+
+  def write(self, marker):
+    """event.json and events.jsonl for a marker."""
     try:
-      self.write_marker(self.root / f'{route}--{segment}', marker)
+      self.write_marker(self.root / f'{marker["route"]}--{marker["segment"]}', marker)
     except OSError:
-      self._error(f'marker {route}--{segment}')
+      self._error(f'marker {marker["route"]}--{marker["segment"]}')
     try:
       self.append(marker)
     except OSError:
       self._error('events.jsonl')
+
+  def record(self, event, route, segment, offset_s, wall_ms, mono=time.monotonic):
+    marker = self.marker(event, route, segment, offset_s, wall_ms)
+    self.lock_all(marker['segments'], mono)
+    self.write(marker)
     return marker
 
   def write_marker(self, directory, marker):
     """One event.json per segment. A second event in the same segment replaces it only if it is more severe;
-    events.jsonl keeps every event."""
+    events.jsonl keeps every event. Two grabs in one segment merge: the newer one, covering both."""
     path = directory / MARKER
     try:
       old = json.loads(path.read_text())
-      if KINDS.index(marker['kind']) >= KINDS.index(old.get('kind')):
+      if old.get('kind') == marker['kind'] == 'grab' and isinstance(old.get('segments'), list):
+        names = {n for n in old['segments'] + marker['segments'] if isinstance(n, str)}
+        marker = {**marker, 'segments': sorted(names, key=lambda n: (n.rsplit('--', 1)[0], int(n.rsplit('--', 1)[1])))}
+      elif KINDS.index(marker['kind']) >= KINDS.index(old.get('kind')):
         return
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
       pass
     tmp = directory / (MARKER + '.tmp')
     with open(tmp, 'w') as f:
@@ -262,6 +280,8 @@ class Recorder:
     os.replace(tmp, path)
 
   def append(self, marker):
+    if self.events_path is None:
+      return
     self.events_path.parent.mkdir(parents=True, exist_ok=True)
     line = (json.dumps(marker, separators=(',', ':')) + '\n').encode()
     fd = os.open(self.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
@@ -284,6 +304,8 @@ class Recorder:
 
   def resume(self, route, mono=time.monotonic):
     """After a restart mid-drive, finish the locks of this route's events."""
+    if self.events_path is None:
+      return
     for marker in read_events(self.events_path, limit=50):
       if marker.get('route') != route:
         continue

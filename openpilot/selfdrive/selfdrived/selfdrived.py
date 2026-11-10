@@ -150,7 +150,8 @@ class SelfdriveD:
     self.state_machine = StateMachine()
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
-    self.ignored_processes = {'mapd', }
+    # phone_relay and event_lockd only serve and protect recordings; they must never block or disengage openpilot
+    self.ignored_processes = {'mapd', 'phone_relay', 'event_lockd'}
 
     # Determine startup event
     is_remote = build_metadata.openpilot.comma_remote or build_metadata.openpilot.sunnypilot_remote

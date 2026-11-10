@@ -338,7 +338,7 @@ def read_events(path, limit=1000):
   return events
 
 
-def main():
+def _run():
   from openpilot.cereal import messaging
   from openpilot.common.gps import get_gps_location_service
   from openpilot.common.params import Params
@@ -353,7 +353,6 @@ def main():
   poller = messaging.Poller()
   socks = {name: messaging.sub_sock(name, poller=poller, conflate=False) for name in ('accelerometer', 'carState', 'userBookmark')}
   socks[gps_service] = messaging.sub_sock(gps_service, poller=poller, conflate=True)
-  names = {sock: name for name, sock in socks.items()}
 
   detector = Detector()
   tracker = SegmentTracker(LOG_ROOT)
@@ -386,8 +385,11 @@ def main():
 
   try:
     while True:
-      for sock in poller.poll(100):
-        name = names[sock]
+      # poll() only waits for traffic: it returns fresh SubSocket wrappers that are not the objects in
+      # `socks` (so they can't be looked up), and an unknown key here used to kill the process on the first
+      # message of every drive. Drain our own sockets instead; drain_sock without wait never blocks.
+      poller.poll(100)
+      for name, sock in socks.items():
         try:
           msgs = messaging.drain_sock(sock)
         except Exception:
@@ -427,11 +429,32 @@ def main():
           recorder.apply_pending()
         except Exception:
           cloudlog.exception('event_lockd: segments')
-        for event in detector.poll(latest_t):
-          finish(event)
+        try:
+          for event in detector.poll(latest_t):
+            finish(event)
+        except Exception:
+          cloudlog.exception('event_lockd: poll')
   finally:
     for event in detector.poll(latest_t, force=True):  # manager stops us when the car turns off
       finish(event)
+
+
+def main():
+  """Never exit: any error is logged and the detector starts over a few seconds later.
+
+  selfdrived also ignores this process (see ignored_processes), so even a crash here can't block or
+  disengage openpilot; staying alive just keeps the footage protection working.
+  """
+  while True:
+    try:
+      _run()
+    except Exception:
+      try:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.exception('event_lockd: restarting after an error')
+      except Exception:
+        pass
+    time.sleep(5)
 
 
 if __name__ == '__main__':

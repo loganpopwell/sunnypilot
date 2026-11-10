@@ -119,6 +119,7 @@ def load_tests(loader, tests, pattern):
   # Pull in the event_lockd tests so they run there too (unittest only calls this when loading this module).
   tests.addTests(loader.loadTestsFromName('openpilot.sunnypilot.phone_relay.tests.test_event_lock'))
   tests.addTests(loader.loadTestsFromName('openpilot.sunnypilot.phone_relay.tests.test_grab'))
+  tests.addTests(loader.loadTestsFromName('openpilot.sunnypilot.phone_relay.tests.test_event_lock_loop'))
   return tests
 
 

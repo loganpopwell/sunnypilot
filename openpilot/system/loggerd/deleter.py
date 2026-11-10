@@ -18,7 +18,10 @@ DELETE_LAST = ['boot', 'crash']
 
 PRESERVE_ATTR_NAME = 'user.preserve'
 PRESERVE_ATTR_VALUE = b'1'
-PRESERVE_COUNT = 5
+# Newest preserved segments the deleter keeps until last. event_lockd marks 4 per event (2 before, the event,
+# 1 after), so 5 would only cover the newest event; 40 covers about the last 10. Preserved footage is still
+# deleted before boot/crash logs if nothing else is left, so recording never stops for it.
+PRESERVE_COUNT = 40
 
 # Set by phone_relay (POST /v1/backed-up) once the iPhone reports the file verified on the homelab.
 BACKED_UP_ATTR_NAME = 'user.phone_relay.backed_up'

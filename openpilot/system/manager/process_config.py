@@ -178,6 +178,8 @@ procs = [
 procs += [
   # Optional read-only phone recording relay, off until /data/phone-relay is paired
   PythonProcess("phone_relay", "openpilot.sunnypilot.phone_relay.device", phone_relay_ready),
+  # Crash/hard-stop/bookmark detector: keeps the footage around an event (user.preserve + event.json). Read-only on the bus.
+  PythonProcess("event_lockd", "openpilot.sunnypilot.phone_relay.event_lock", only_onroad),
 
   # Models
   PythonProcess("models_manager", "openpilot.sunnypilot.models.manager", only_offroad),

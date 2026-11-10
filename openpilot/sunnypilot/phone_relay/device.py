@@ -23,6 +23,7 @@ from socketserver import ThreadingMixIn
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 from .common import FILE, MAX_FILE, atomic_json
+from .event_lock import EVENTS_PATH, is_locked, read_events
 
 
 # qcamera.ts is small (~2 MB/min) and carries the microphone track when Record Audio is on.
@@ -43,6 +44,7 @@ BACKED_UP_ATTR = 'user.phone_relay.backed_up'
 BACKED_UP_VALUE = b'1'
 MAX_BACKED_UP = 5000
 MAX_BODY = 1024 * 1024
+MAX_EVENTS = 500  # newest events returned by GET /v1/events
 
 if sys.platform == 'darwin':  # tests on a Mac; the comma is Linux and uses os.*xattr
     import ctypes
@@ -118,8 +120,9 @@ def stamp(info):
 
 
 class RecordingStore:
-    def __init__(self, root, onroad=lambda: False, served=SERVED, cache=None):
+    def __init__(self, root, onroad=lambda: False, served=SERVED, cache=None, events=None):
         self.root = Path(root).resolve()
+        self.events_path = Path(events) if events else None  # event_lockd's log
         self.budget = Budget(onroad)
         self.served = tuple(served)
         # Digests keyed by path, valid while (inode, size, mtime) match: {path: [ino, size, mtime_ns, sha256]}.
@@ -304,19 +307,28 @@ class RecordingStore:
                 'free_bytes': usage.f_bavail * usage.f_frsize, 'served': list(self.served),
                 'onroad_rate': self.budget.rate, 'time': time.time(), **self.backup_summary(segments)}
 
+    def events(self):
+        """Events logged by event_lockd, newest first."""
+        return {'events': read_events(self.events_path, MAX_EVENTS) if self.events_path else []}
+
     def manifest(self, offset=0):
         """Path, size and mtime of each closed served file; sha256 only when already known. Never reads
         file contents, so it answers immediately even while driving. Pagination is stable for a
-        stationary recording directory; repeated scans dedupe by path."""
+        stationary recording directory; repeated scans dedupe by path. locked: the segment directory
+        has user.preserve (event_lockd or a bookmark), so the deleter removes it last."""
         names = self.names()
         files = []
+        locked = {}
         for name in names[offset:offset + PAGE]:
             try:
                 with self.open_file(name) as f:
                     info = os.fstat(f.fileno())
             except OSError:
                 continue
-            item = {'path': name, 'size': info.st_size, 'mtime': info.st_mtime_ns / 1e9}
+            segment = name.split('/')[0]
+            if segment not in locked:
+                locked[segment] = is_locked(self.root / segment)
+            item = {'path': name, 'size': info.st_size, 'mtime': info.st_mtime_ns / 1e9, 'locked': locked[segment]}
             sha = self.cached_digest(name, info)
             if sha:
                 item['sha256'] = sha
@@ -475,6 +487,8 @@ def handler(store, token_hash, wifi_state=None, server_slots=None):
                     value['active_connections'] = server_slots() if server_slots else None
                     value['downloads_active'] = getattr(self.server, 'downloads_active', None)
                     self.send_json(value)
+                elif url.path == '/v1/events':
+                    self.send_json(store.events())
                 elif url.path == '/v1/manifest':
                     offset = int(parse_qs(url.query).get('offset', ['0'])[0])
                     if not 0 <= offset <= 1000000:
@@ -558,7 +572,8 @@ def main():
     params = Params()
     def onroad():
         return not params.get_bool('IsOffroad')
-    store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json')
+    store = RecordingStore('/data/media/0/realdata', onroad, config.get('files', SERVED), '/data/phone-relay/hashes.json',
+                           EVENTS_PATH)
     state = {}
     server = BoundedServer(('0.0.0.0', 8743), None, tls=context)
     server.RequestHandlerClass = handler(store, config['token_sha256'], lambda: state.get('wifi'),
